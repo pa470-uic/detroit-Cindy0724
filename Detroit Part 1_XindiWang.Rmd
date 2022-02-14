@@ -1,0 +1,531 @@
+---
+title: "Detroit Part 1"
+author: "Xindi Wang"
+date: "2/9/2022"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    df_print: paged
+    theme: flatly
+    number_sections: yes
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(DBI)
+library(dbplyr)
+library(sf)
+library(RSQLite)
+library(lubridate)
+library(ggpubr)
+library(gridExtra)
+
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      eval= TRUE)
+
+my_theme <- theme_classic() +
+  theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+        plot.subtitle = element_text(face = "italic", size = 10, hjust = 0.5),
+        axis.title = element_text(face = "bold", size = 10),
+        axis.text = element_text(size = 8),
+        legend.title = element_text(family = "Times", size = 8, face = "bold"),
+        legend.text = element_text(family = "Times", size = 6, face = "italic"),
+        panel.background = element_blank())
+```
+
+```{r}
+con <- dbConnect(RSQLite::SQLite(), "database/detroit.sqlite")
+
+DBI::dbListTables(con)
+
+assessments <- dbReadTable(con, "assessments")
+sales <- dbReadTable(con, "sales")
+parcels <- dbReadTable(con, "parcels")
+parcels_historic <- dbReadTable(con, "parcels_historic")
+blight <- dbReadTable(con, "blight")
+foreclosures <- dbReadTable(con, "foreclosures")
+```
+
+# Section A: EDA
+
+## Assessed Value & Sales Price
+
+No null value for assessed value and sale price.
+```{r}
+assessments %>%
+  summarise(assessed_miss_value = sum(is.na(ASSESSEDVALUE))) # no missing value
+
+sales %>%
+  summarise(sale_price_miss_value = sum(is.na(sale_price))) # no missing value
+```
+
+The distribution of Assessed Value (AV), Taxable Value (TV), and Sale Price: Whether it is assessed value, taxable value, or sales price, there are very many zero values, which imply an unfair deal.
+```{r}
+plot_assessed_value <- assessments %>%
+  ggplot(aes(x = ASSESSEDVALUE)) +
+  geom_boxplot() +
+  labs(x = "Assessed Value") +
+  my_theme
+
+plot_taxable_value <- assessments %>%
+  ggplot(aes(x = TAXABLEVALUE)) +
+  geom_boxplot() +
+  labs(x = "Taxable Value") +
+  my_theme
+
+plot_sale_price <- sales %>%
+  ggplot(aes(x = sale_price)) +
+  geom_boxplot() +
+  labs(x = "Sale Price") +
+  my_theme
+
+ggarrange(plot_assessed_value, plot_taxable_value, plot_sale_price,
+          nrow = 3)
+```
+
+Records with an assessed value of 0 accounted for 81.5% and records with a sales price of 0 accounted for 83.7%.
+
+```{r}
+assessments %>%
+  mutate(assessed_value_0 = ifelse(ASSESSEDVALUE == 0,
+                                   1,
+                                   0)) %>%
+  group_by(assessed_value_0) %>%
+  summarise(count = n()) %>%
+  mutate(prop = count / sum(count))
+
+sales %>%
+  mutate(sale_price_0 = ifelse(sale_price == 0,
+                               1,
+                               0)) %>%
+  group_by(sale_price_0) %>%
+  summarise(count = n()) %>%
+  mutate(prop = count / sum(count))
+```
+
+
+1. Assessed Value: The assessed values, both median and mean, showed a decreasing trend from 2011 to 2017, then gradually rebounded, but there was another very significant decrease from 2020 to 2021. 2022 showed a significant rebound, but considering the small sample size in 2022, the analysis is not very meaningful. The median values from 2017 to 2021 are very low, indicating a large number of zero values.
+
+2. Sale Price: Sales prices show a relatively flat trend from 2011 to 2016, with a gradual increase after 2016. Like the assessed value, the median sales price is at a very low level from 2011 to 2020, indicating that there are also a large number of zero values influencing the distribution.
+
+```{r}
+plot_assess <- assessments %>%
+  group_by(year) %>%
+  summarise(median_assess_value = median(ASSESSEDVALUE),
+            mean_assess_value = mean(ASSESSEDVALUE)) %>%
+  pivot_longer(c("median_assess_value", "mean_assess_value"),
+               names_to = "type",
+               values_to = "value") %>%
+  ggplot(aes(x = as.factor(year),
+             y = value,
+             group = type,
+             color = type)) +
+  geom_point() +
+  geom_line() +
+  labs(x = "Year",
+       y = "Assessed Value") +
+  scale_color_discrete(name = "Type",
+                       labels = c("Mean", "Median")) +
+  my_theme
+
+plot_sales <- sales %>%
+  mutate(year = year(sale_date)) %>%
+  group_by(year) %>%
+  summarise(median_sale_price = median(sale_price),
+            mean_sale_price = mean(sale_price)) %>%
+  pivot_longer(c("median_sale_price", "mean_sale_price"),
+               names_to = "type",
+               values_to = "value") %>%
+  ggplot(aes(x = as.factor(year),
+             y = value,
+             group = type,
+             color = type)) +
+  geom_point() +
+  geom_line() +
+  labs(x = "Year",
+       y = "Sale Price") +
+  scale_color_discrete(name = "Type",
+                       labels = c("Mean", "Median")) +
+  my_theme
+
+ggarrange(plot_assess, plot_sales, nrow = 2)
+```
+
+After filtering out these unfair transactions by setting the threshold at 1,000, the median and average of the assessed value and sales price for each year are compared as shown below: The overall trend of both assessed values and sales prices did not change much after removing a portion of the records, but the median and average values increased significantly from year to year.
+
+```{r}
+plot_assess_1 <- assessments %>%
+  filter(ASSESSEDVALUE >= 1000) %>%
+  group_by(year) %>%
+  summarise(median_assess_value = median(ASSESSEDVALUE),
+            mean_assess_value = mean(ASSESSEDVALUE)) %>%
+  pivot_longer(c("median_assess_value", "mean_assess_value"),
+               names_to = "type",
+               values_to = "value") %>%
+  ggplot(aes(x = as.factor(year),
+             y = value,
+             group = type,
+             color = type)) +
+  geom_point() +
+  geom_line() +
+  labs(x = "Year",
+       y = "Assessed Value") +
+  scale_color_discrete(name = "Type",
+                       labels = c("Mean", "Median")) +
+  my_theme
+
+plot_sales_1 <- sales %>%
+  filter(sale_price >= 1000) %>%
+  mutate(year = year(sale_date)) %>%
+  group_by(year) %>%
+  summarise(median_sale_price = median(sale_price),
+            mean_sale_price = mean(sale_price)) %>%
+  pivot_longer(c("median_sale_price", "mean_sale_price"),
+               names_to = "type",
+               values_to = "value") %>%
+  ggplot(aes(x = as.factor(year),
+             y = value,
+             group = type,
+             color = type)) +
+  geom_point() +
+  geom_line() +
+  labs(x = "Year",
+       y = "Sale Price") +
+  scale_color_discrete(name = "Type",
+                       labels = c("Mean", "Median")) +
+  my_theme
+
+ggarrange(plot_assess_1, plot_sales_1, nrow = 2)
+```
+
+## Foreclosures
+
+The following chart shows the number of properties foreclosed on in Detroit each year between 2002 and 2019. The number of foreclosed properties increased significantly between 2012 and 2015.
+
+```{r}
+foreclosures_1 <- foreclosures
+
+colnames(foreclosures_1)[3:20] <- c("2002" : "2019")
+
+foreclosures_1 <- pivot_longer(foreclosures_1,
+                               c("2002" : "2019"),
+                               names_to = "year",
+                               values_to = "foreclosure")
+
+foreclosures_1 %>%
+  group_by(year) %>%
+  summarise(num_foreclosure = sum(foreclosure, na.rm = T)) %>%
+  ggplot(aes(x = as.factor(year),
+             y = num_foreclosure)) +
+  geom_bar(stat = "identity") +
+  labs(x = "Year",
+       y = "Number of Tax Foreclosures",
+       title = "Number of Tax Foreclosures of Properties in Detroit",
+       subtitle = "from 2002 to 2019") +
+  my_theme
+```
+
+After removing the unfair transaction records, the number of over-assessed properties is calculated based on "the assessed value does not exceed 50% of the market value of each property". From 2011 to 2019, the trend in the number of over-assessed properties is roughly the same as the trend in foreclosures, so it is reasonable to assume that many tax foreclosures are the result of illegally inflated tax assessments.
+
+```{r}
+sales <- sales %>%
+  mutate(year = year(sale_date))
+
+sales_assess <- left_join(sales, assessments, by = c("parcel_num" = "PARCELNO", "year" = "year"))
+
+sales_assess_1 <- sales_assess %>%
+  filter(ASSESSEDVALUE >= 0,
+         sale_price >= 1000) %>%
+  select(parcel_num, year, sale_price, ASSESSEDVALUE, TAXABLEVALUE, sale_terms)
+
+plot_overassessed <- sales_assess_1 %>%
+  mutate(diff = sale_price * 0.5 - ASSESSEDVALUE,
+         overassessed = ifelse(diff < 0,
+                               1,
+                               0)) %>%
+  filter(overassessed == 1,
+         year < 2020) %>%
+  group_by(year) %>%
+  summarise(count = n()) %>%
+  ggplot(aes(x = as.factor(year),
+             y = count)) +
+  geom_bar(stat = "identity") +
+  labs(x = "Year",
+       y = "Number of Overassessed Properties",
+       title = "Number of Overassessed Properties in Detroit",
+       subtitle = "from 2011 to 2019") +
+  my_theme
+
+plot_foreclosures <- foreclosures_1 %>%
+  filter(year > 2010) %>%
+  group_by(year) %>%
+  summarise(num_foreclosure = sum(foreclosure, na.rm = T)) %>%
+  ggplot(aes(x = as.factor(year),
+             y = num_foreclosure)) +
+  geom_bar(stat = "identity") +
+  labs(x = "Year",
+       y = "Number of Tax Foreclosures",
+       title = "Number of Tax Foreclosures of Properties in Detroit",
+       subtitle = "from 2011 to 2019") +
+  my_theme
+
+ggarrange(plot_foreclosures, plot_overassessed,
+          nrow = 2)
+```
+
+## Blight
+
+There are a large number of outstanding tickets and unknown status records in the blight.
+
+```{r}
+blight %>%
+  group_by(payment_status) %>%
+  summarise(count = n()) %>%
+  ggplot(aes(x = payment_status,
+             y = count)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = count),
+            vjust = -0.5) +
+  labs(x = "Payment Status",
+       y = "Number of Records",
+       title = "Number of Blights for Different Payment Statuses") +
+  my_theme
+```
+
+# Section B: cmfproperty
+
+```{r}
+library(usethis)
+library(devtools)
+library(cmfproperty)
+```
+
+```{r}
+sales_assess_2 <- sales_assess %>%
+  filter(as.numeric(sale_price) > 1000) %>%
+  select(year, sale_price, ASSESSEDVALUE) %>%
+  rename(SALE_YEAR = year, SALE_PRICE = sale_price, ASSESSED_VALUE = ASSESSEDVALUE)
+
+ratio <- cmfproperty::reformat_data(
+  sales_assess_2,
+  sale_col = "SALE_PRICE",
+  assessment_col = "ASSESSED_VALUE",
+  sale_year_col = "SALE_YEAR"
+)
+
+stats <- cmfproperty::calc_iaao_stats(ratio)
+```
+
+1. The number of arm's length sales drops significantly in 2020.
+2. From 2011 to 2020, the assessed value gradually decreases, but after 2016, the sales price gradually increases.
+3. The ratio between assessed value and sale price decreases every year. Median sales ratio also shows a significant downward trend from 2011 to 2020.
+
+```{r}
+output <- diagnostic_plots(stats,
+                           ratio,
+                           min_reporting_yr = 2011,
+                           max_reporting_yr = 2020)
+
+gridExtra::grid.arrange(output[[1]], output[[2]],
+                        output[[3]], output[[5]],
+                        nrow = 2)
+```
+
+```{r}
+gridExtra::grid.arrange(output[[6]], output[[7]],
+                        output[[8]], output[[9]],
+                        nrow = 2)
+```
+
+The graph below shows a binned scatter plot of sales ratios against sale prices. The graph compares the latest value in 2020 (solid line) with the average of all observed years from 2011 to 2020 (dashed line). The downward sloping dashed line indicates that the more expensive homes are over-assessed compared to the less expensive homes and is evidence of regressivity.
+
+```{r}
+binned <- cmfproperty::binned_scatter(ratio,
+                                      min_reporting_yr = 2011,
+                                      max_reporting_yr = 2020,
+                                      jurisdiction_name = "Detroit, Michigan")
+binned[[1]]
+```
+
+```{r}
+binned[[2]]
+```
+
+The chart below shows the percentage of properties in each decile that are overassessed or underassessed relative to the median assessed rate.
+
+```{r}
+pct_over <- cmfproperty::pct_over_under(ratio,
+                                        min_reporting_yr = 2011,
+                                        max_reporting_yr = 2020,
+                                        jurisdiction_name = "Detroit, Michigan")
+pct_over[[1]]
+```
+
+```{r}
+pct_over[[2]]
+```
+
+The COD is a measure of assessment uniformity, or horizontal equity. It is the average absolute percentage difference from the median sales ratio. The IAAO specifies an acceptable range for COD below 15. Detroit's COD is significantly higher than 15 and did not meet the IAAO standard for uniformity.
+
+```{r}
+iaao_rslt <- cmfproperty::iaao_graphs(stats,
+                                      ratio,
+                                      min_reporting_yr = 2011,
+                                      max_reporting_yr = 2020,
+                                      jurisdiction_name = "Detroit, Michigan")
+
+iaao_rslt[[2]]
+```
+
+The PRD is a measure of regressivity, or vertical equity. A PRD of 1 indicates that homes are assessed at the same rate regardless of their sale price. A PRD greater than 1 indicates that less expensive homes are assessed at higher rates than more expensive homes, while a PRD less than 1 represents the opposite situation. The IAAO specifies that the acceptable range of PRD is .98 to 1.03. Detroit did not meet the IAAO standard for vertical equity.
+
+```{r}
+iaao_rslt[[4]]
+```
+
+The PRB is another quantitative measure of regressivity (vertical equity) which is an alternative to the PRD. PRB is a measure of how much assessed values change as a property’s market value increases. The IAAO specifies that the acceptable range for PRB is between -0.05 and 0.05. Detroit did not meet the standard.
+
+```{r}
+iaao_rslt[[6]]
+```
+
+
+```{r}
+m_rslt <- cmfproperty::monte_carlo_graphs(ratio)
+
+gridExtra::grid.arrange(m_rslt[[1]], m_rslt[[2]], m_rslt[[3]],
+                        m_rslt[[4]], m_rslt[[5]], m_rslt[[6]],
+                        nrow = 3)
+```
+
+# Section C
+
+Selling price did not show a strong correlation with any variable, but a relatively strong correlation with these three variables: total_floor_area, assessed_value, taxable_value.
+
+```{r}
+# There seems to be some problem with the "sale date" in the parcels extracted from the database, so loading the parcels table separately
+parcels_1 <- read_csv("Parcels.csv")
+
+parcels_1 %>%
+  filter(sale_price >= 1000) %>%
+  select(sale_price, year_built, total_square_footage, total_acreage, frontage, depth, 
+         total_floor_area, assessed_value, taxable_value) %>%
+  corrr::correlate() %>%
+  corrr::rplot(colors = "Brown")
+```
+```{r}
+aov(sale_price ~ year(sale_date), data=parcels_1) %>% tidy()
+
+parcels_2 <- parcels_1 %>%
+  filter(sale_price >= 1000) %>%
+  mutate(year = year(sale_date))
+
+parcels_2 %>% 
+  group_by(year) %>%
+  summarise(ave_sale_price = mean(sale_price)) %>%
+  ggplot(aes(x = year,
+             y = ave_sale_price)) +
+  geom_smooth()
+```
+
+The R-squared is 0.39, the model fits not well.
+
+```{r}
+model_1 <- lm(sale_price ~ total_floor_area + assessed_value, data = parcels_2)
+
+model_1 %>% tidy()
+
+model_1 %>% glance()
+
+model_1 %>% augment()
+```
+
+```{r}
+ggplot(model_1 %>% augment(), aes(x=log(assessed_value))) +
+  geom_density(fill='navy', alpha=.6)
+```
+
+The R-squared is 0.55, the model fits better.
+
+```{r}
+model_2 <- lm(sale_price ~ factor(year) + total_floor_area + log(assessed_value), data = parcels_2 %>% filter(assessed_value > 0,
+                                                                                                              year > 2010))
+model_2 %>% tidy()
+
+model_2 %>% glance()
+
+model_2 %>% augment()
+```
+
+# Section D
+```{r}
+foreclosures_2 <- foreclosures %>%
+  select(prop_addr, prop_parcelnum) %>%
+  mutate(foreclosure = 1)
+
+foreclosures_3 <- left_join(parcels_1, foreclosures_2, by = c("address" = "prop_addr", "parcel_number" = "prop_parcelnum"))
+
+library(imputeTS)
+foreclosures_3$foreclosure <- na.replace(foreclosures_3$foreclosure, 0)
+
+foreclosures_3_mini <- foreclosures_3 %>%
+  filter(sale_price >= 1000) %>%
+  select(foreclosure, sale_price, assessed_value)
+
+foreclosures_3_mini$foreclosure <- as.factor(foreclosures_3_mini$foreclosure)
+
+split <- initial_split(foreclosures_3_mini)
+
+train <- training(split)
+test <- testing(split)
+```
+
+The closer the VIF is to 1, the lighter the multicollinearity is.
+
+```{r}
+log_model <- logistic_reg() %>%
+  set_engine('glm') %>%
+  set_mode('classification') %>%
+  fit(foreclosure ~ sale_price + assessed_value,
+      data = train)
+
+log_model %>% tidy()
+
+log_model %>% extract_fit_engine() %>%
+  car::vif()
+```
+
+
+```{r}
+log_model %>%
+  predict(test, type='prob')
+
+log_model %>%
+  predict(test, type='class')
+
+test_preds <- log_model %>% augment(test)
+
+test_preds %>% select(foreclosure, .pred_class, .pred_0, .pred_1)
+
+test_preds %>% count(foreclosure, .pred_class)
+
+roc_auc(test_preds,
+        truth = foreclosure,
+        estimate = .pred_0)
+
+roc_curve(test_preds,
+        truth = foreclosure,
+        estimate = .pred_0) %>%
+  autoplot()
+
+specificity(test_preds,
+        truth = foreclosure,
+        estimate = .pred_class) 
+
+sensitivity(test_preds,
+        truth = foreclosure,
+        estimate = .pred_class)
+```
+
